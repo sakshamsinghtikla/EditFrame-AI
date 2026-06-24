@@ -1,222 +1,167 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // src/config/ffmpeg.js
-// fluent-ffmpeg configuration: binary paths, temp directory, codec presets.
+// FFmpeg configuration using bundled static binaries (no system install needed).
+// Also provides temp-directory helpers used across the app.
+// Soft-fails: if packages/binaries are missing, it warns instead of crashing.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import ffmpeg from 'fluent-ffmpeg';
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import { v4 as uuidv4 } from 'uuid';
+
+let ffmpeg = null;
+let ffmpegReady = false;
+
+// ─── Wire up fluent-ffmpeg with static binaries ──────────────────────────────
+
+try {
+  const mod          = await import('fluent-ffmpeg');
+  ffmpeg             = mod.default;
+  const ffmpegStatic = (await import('ffmpeg-static')).default;
+  const ffprobeStatic = (await import('ffprobe-static')).default;
+
+  if (ffmpegStatic)  ffmpeg.setFfmpegPath(ffmpegStatic);
+  if (ffprobeStatic?.path) ffmpeg.setFfprobePath(ffprobeStatic.path);
+
+  ffmpegReady = true;
+  console.log('[FFmpeg] Ready (using bundled static binaries)');
+} catch (err) {
+  console.warn('[FFmpeg] Not configured — run: npm install fluent-ffmpeg ffmpeg-static ffprobe-static');
+  console.warn(`[FFmpeg] (${err.message})`);
+}
+
+// ─── Temp directory helpers (used by image + video services) ─────────────────
 
 /**
- * Configure fluent-ffmpeg paths and ensure the temp directory exists.
- * Soft-fails on permission errors — ffmpeg features won't work but server boots.
+ * Returns a writable temp directory, creating it if needed.
+ * Prefers FFMPEG_TEMP_DIR from .env, falls back to the OS temp dir.
  */
-export function configureFfmpeg() {
-  // Set explicit binary paths if provided
-  if (process.env.FFMPEG_PATH)  ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
-  if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
-
-  // Build temp dir path — fall back to OS temp dir if env not set
-  const tempDir = getTempDir();
-
+export function getTempDir() {
+  const preferred = process.env.FFMPEG_TEMP_DIR;
+  const dir = preferred || path.join(os.tmpdir(), 'editframe-temp');
   try {
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-      console.log(`[FFmpeg] Temp directory created: ${tempDir}`);
-    }
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
   } catch (err) {
-    // Try fallback to OS temp dir
-    const fallback = path.join(os.tmpdir(), 'editframe');
-    console.warn(
-      `[FFmpeg] Could not create temp dir at ${tempDir}: ${err.message}\n` +
-      `         Falling back to: ${fallback}`
-    );
-    try {
-      if (!fs.existsSync(fallback)) {
-        fs.mkdirSync(fallback, { recursive: true });
-      }
-      process.env.FFMPEG_TEMP_DIR = fallback;
-      console.log(`[FFmpeg] Using fallback temp dir: ${fallback}`);
-    } catch (err2) {
-      console.warn(
-        `[FFmpeg] Could not create fallback temp dir: ${err2.message}\n` +
-        `         Video processing features will be unavailable.`
-      );
-    }
+    // Fall back to OS temp if the preferred dir can't be created (e.g. Windows EPERM)
+    const fallback = path.join(os.tmpdir(), 'editframe-temp');
+    try { if (!fs.existsSync(fallback)) fs.mkdirSync(fallback, { recursive: true }); } catch (_) {}
+    return fallback;
   }
 }
 
-// ─── Temp file helpers ────────────────────────────────────────────────────────
-
 /**
- * Returns the configured temp directory path.
- * @returns {string}
+ * Creates (and returns) a unique sub-directory inside the temp dir,
+ * useful for per-job frame folders.
  */
-export function getTempDir() {
-  // Use env var if set, otherwise use OS temp dir
-  return process.env.FFMPEG_TEMP_DIR || path.join(os.tmpdir(), 'editframe');
+export function getJobDir(jobId) {
+  const dir = path.join(getTempDir(), jobId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
-/**
- * Build a unique temp file path for intermediate ffmpeg outputs.
- * @param {string} suffix   - File extension e.g. '.mp4'
- * @param {string} [prefix] - Optional prefix e.g. 'trim_'
- * @returns {string}
- */
-export function tempFilePath(suffix = '.mp4', prefix = 'ef_') {
-  const name = `${prefix}${Date.now()}_${Math.random().toString(36).slice(2, 8)}${suffix}`;
-  return path.join(getTempDir(), name);
-}
-
-/**
- * Delete a temp file, ignoring errors.
- * @param {string} filePath
- */
+/** Best-effort delete of a single temp file. */
 export function cleanTempFile(filePath) {
-  try {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (_) { /* noop */ }
+  if (!filePath) return;
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
 }
 
-// ─── FFprobe helper ───────────────────────────────────────────────────────────
+/**
+ * Build a unique temp file path with a given extension and optional prefix.
+ * (Does not create the file — just returns a path inside the temp dir.)
+ * @param {string} [ext='.tmp']
+ * @param {string} [prefix='tmp_']
+ * @returns {string}
+ */
+export function tempFilePath(ext = '.tmp', prefix = 'tmp_') {
+  const safeExt = ext.startsWith('.') ? ext : `.${ext}`;
+  return path.join(getTempDir(), `${prefix}${uuidv4()}${safeExt}`);
+}
 
 /**
- * Probe a media file and return its metadata.
- * @param {string} filePath
- * @returns {Promise<ffmpeg.FfprobeData>}
+ * Probe a media file/URL with ffprobe and return the raw metadata object.
+ * @param {string} input - local path or URL
+ * @returns {Promise<object>} raw ffprobe data
  */
-export function probeMedia(filePath) {
+export function probeMedia(input) {
+  const ff = getFfmpeg();
   return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) return reject(err);
-      resolve(metadata);
+    ff.ffprobe(input, (err, data) => {
+      if (err) return reject(new Error(`ffprobe failed: ${err.message}`));
+      resolve(data);
     });
   });
 }
 
 /**
- * Extract key media properties from ffprobe metadata.
- * @param {ffmpeg.FfprobeData} metadata
- * @returns {object}
+ * Normalize raw ffprobe metadata into the fields EditFrame stores.
+ * @param {object} metadata - raw ffprobe output (from probeMedia)
+ * @returns {{ durationSec:number, fps:number, width:number, height:number, codec:string, frameCount:number, hasAudio:boolean }}
  */
 export function extractMediaInfo(metadata) {
-  const videoStream = metadata.streams.find((s) => s.codec_type === 'video');
-  const audioStream = metadata.streams.find((s) => s.codec_type === 'audio');
+  const streams = metadata?.streams || [];
+  const video   = streams.find((s) => s.codec_type === 'video');
+  const audio   = streams.find((s) => s.codec_type === 'audio');
 
-  let fps = null;
-  if (videoStream?.r_frame_rate) {
-    const [num, den] = videoStream.r_frame_rate.split('/').map(Number);
-    fps = den ? Math.round((num / den) * 100) / 100 : null;
+  let fps = 0;
+  if (video?.r_frame_rate && video.r_frame_rate.includes('/')) {
+    const [a, b] = video.r_frame_rate.split('/').map(Number);
+    if (b > 0) fps = a / b;
+  } else if (video?.avg_frame_rate && video.avg_frame_rate.includes('/')) {
+    const [a, b] = video.avg_frame_rate.split('/').map(Number);
+    if (b > 0) fps = a / b;
   }
+
+  const durationSec = parseFloat(metadata?.format?.duration || video?.duration || 0);
+  const frameCount  = video?.nb_frames
+    ? parseInt(video.nb_frames, 10)
+    : (fps ? Math.round(durationSec * fps) : 0);
 
   return {
-    duration:  parseFloat(metadata.format?.duration) || 0,
-    width:     videoStream?.width  || null,
-    height:    videoStream?.height || null,
-    fps,
-    hasVideo:  !!videoStream,
-    hasAudio:  !!audioStream,
-    bitrate:   parseInt(metadata.format?.bit_rate) || null,
-    sizeBytes: parseInt(metadata.format?.size)     || null,
+    durationSec,
+    fps:        fps ? Math.round(fps * 1000) / 1000 : 0,
+    width:      video?.width  || null,
+    height:     video?.height || null,
+    codec:      video?.codec_name || null,
+    frameCount,
+    hasAudio:   !!audio,
   };
 }
 
-// ─── Codec & quality presets ──────────────────────────────────────────────────
+/** Best-effort recursive delete of a temp directory (e.g. a job's frames). */
+export function cleanTempDir(dirPath) {
+  if (!dirPath) return;
+  try { if (fs.existsSync(dirPath)) fs.rmSync(dirPath, { recursive: true, force: true }); } catch (_) {}
+}
 
-/**
- * Returns ffmpeg output options for a given quality preset + format.
- * @param {'draft'|'medium'|'high'|'master'} quality
- * @param {'mp4'|'mov'|'webm'|'gif'}         format
- * @param {string}                            [codec]
- * @returns {string[]}
- */
-export function getOutputOptions(quality = 'high', format = 'mp4', codec = null) {
-  const presets = {
-    draft:  { videoBitrate: '2000k',  audioBitrate: '128k', crf: 28 },
-    medium: { videoBitrate: '4000k',  audioBitrate: '192k', crf: 23 },
-    high:   { videoBitrate: '8000k',  audioBitrate: '256k', crf: 20 },
-    master: { videoBitrate: '20000k', audioBitrate: '320k', crf: 16 },
-  };
-  const preset = presets[quality] || presets.high;
+/** Whether FFmpeg is available. */
+export function isFfmpegReady() {
+  return ffmpegReady;
+}
 
-  if (format === 'gif') return ['-loop', '0'];
-
-  if (format === 'webm') {
-    return [
-      '-c:v', codec || 'libvpx-vp9',
-      '-b:v', preset.videoBitrate,
-      '-crf', String(preset.crf),
-      '-c:a', 'libopus',
-      '-b:a', preset.audioBitrate,
-    ];
+/** The configured fluent-ffmpeg instance (or null if unavailable). */
+export function getFfmpeg() {
+  if (!ffmpegReady || !ffmpeg) {
+    throw new Error('FFmpeg is not available. Run: npm install fluent-ffmpeg ffmpeg-static ffprobe-static');
   }
-
-  if (format === 'mov') {
-    return [
-      '-c:v', codec === 'ProRes 422' ? 'prores_ks' : 'libx264',
-      '-profile:v', codec === 'ProRes 422' ? 'lt' : 'high',
-      '-crf', String(preset.crf),
-      '-b:v', preset.videoBitrate,
-      '-c:a', 'aac',
-      '-b:a', preset.audioBitrate,
-      '-movflags', '+faststart',
-    ];
-  }
-
-  const videoCodec = codec === 'H.265/HEVC' ? 'libx265' : 'libx264';
-  return [
-    '-c:v', videoCodec,
-    '-preset', quality === 'master' ? 'slow' : quality === 'draft' ? 'ultrafast' : 'medium',
-    '-crf', String(preset.crf),
-    '-b:v', preset.videoBitrate,
-    '-c:a', 'aac',
-    '-b:a', preset.audioBitrate,
-    '-movflags', '+faststart',
-  ];
+  return ffmpeg;
 }
 
 /**
- * Returns the ffmpeg scale filter string for a resolution identifier.
- * @param {string} resolution
- * @returns {string}
+ * Called by server.js at startup. Configuration already happens at import time
+ * (above), so this just reports status and ensures the temp dir exists.
+ * Kept for backward compatibility with the original API.
+ * @returns {boolean} whether FFmpeg is ready
  */
-export function getScaleFilter(resolution) {
-  const map = {
-    R_480P:  'scale=854:480',
-    R_720P:  'scale=1280:720',
-    R_1080P: 'scale=1920:1080',
-    R_1440P: 'scale=2560:1440',
-    R_4K:    'scale=3840:2160',
-  };
-  return map[resolution] || 'scale=1920:1080';
-}
-
-/**
- * Build color grading vf filter string from timeline clip settings.
- * @param {object} colorGrade
- * @returns {string}
- */
-export function buildColorFilter(colorGrade = {}) {
-  const {
-    brightness = 0,
-    contrast   = 1,
-    saturation = 1,
-    hue        = 0,
-    sharpness  = 0,
-  } = colorGrade;
-
-  const filters = [];
-  filters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
-  if (hue !== 0) {
-    const hueRad = (hue * Math.PI) / 180;
-    filters.push(`hue=h=${hueRad}`);
+export function configureFfmpeg() {
+  try { getTempDir(); } catch (_) {}
+  if (ffmpegReady) {
+    console.log('[FFmpeg] configureFfmpeg(): ready');
+  } else {
+    console.warn('[FFmpeg] configureFfmpeg(): not available — video features disabled until installed');
   }
-  if (sharpness > 0) {
-    const amount = (sharpness / 100) * 3;
-    filters.push(`unsharp=5:5:${amount}:5:5:0`);
-  }
-  return filters.join(',');
+  return ffmpegReady;
 }
 
 export default ffmpeg;
