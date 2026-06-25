@@ -3,9 +3,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   X, Plus, Download, Trash2, Film, Music, Image,
   Clock, HardDrive, Info, ZoomIn, ZoomOut,
-  ChevronLeft, ChevronRight, Pencil
+  ChevronLeft, ChevronRight, Pencil, Layers
 } from 'lucide-react';
 import AssetEditorModal from '../Editor/AssetEditorModal.jsx';
+import VideoFrameStudio from '../Editor/VideoFrameStudio.jsx';
 
 function formatDuration(secs) {
   if (!secs) return null;
@@ -115,17 +116,22 @@ export default function AssetPreviewModal({
 }) {
   const [showInfo, setShowInfo]     = useState(false);
   const [showEditor, setShowEditor] = useState(false);
+  const [showFrames, setShowFrames] = useState(false);
   const [deleting, setDeleting]     = useState(false);
+
+  const isVideo = asset.type === 'VIDEO';
 
   useEffect(() => {
     const handler = (e) => {
+      // Don't let preview-modal shortcuts fire while a child studio/editor is open
+      if (showEditor || showFrames) return;
       if (e.key === 'Escape')       onClose();
       if (e.key === 'ArrowLeft'  && hasPrev) onPrev?.();
       if (e.key === 'ArrowRight' && hasNext) onNext?.();
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [onClose, hasPrev, hasNext, onPrev, onNext]);
+  }, [onClose, hasPrev, hasNext, onPrev, onNext, showEditor, showFrames]);
 
   const handleDelete = async () => {
     if (!confirm(`Delete "${asset.name}"? This cannot be undone.`)) return;
@@ -171,12 +177,21 @@ export default function AssetPreviewModal({
             <button onClick={() => setShowInfo(!showInfo)} className={`p-2 rounded-lg transition-colors ${showInfo ? 'bg-white/10 text-white' : 'text-white/40 hover:text-white/70 hover:bg-white/5'}`} title="File info">
               <Info className="w-4 h-4" />
             </button>
-            {/* Edit button — only for image and video */}
+
+            {/* Frame Studio — video only */}
+            {isVideo && (
+              <button onClick={() => setShowFrames(true)} className="p-2 rounded-lg text-white/40 hover:text-cyan-400 hover:bg-cyan-500/10 transition-colors" title="Frame Studio">
+                <Layers className="w-4 h-4" />
+              </button>
+            )}
+
+            {/* Edit button — image and video */}
             {asset.type !== 'AUDIO' && (
               <button onClick={() => setShowEditor(true)} className="p-2 rounded-lg text-white/40 hover:text-cyan-400 hover:bg-cyan-500/10 transition-colors" title="Edit">
                 <Pencil className="w-4 h-4" />
               </button>
             )}
+
             <a href={mediaUrl} target="_blank" download={asset.name} className="p-2 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/5 transition-colors" title="Download">
               <Download className="w-4 h-4" />
             </a>
@@ -258,13 +273,27 @@ export default function AssetPreviewModal({
         </div>
       </motion.div>
 
-      {/* Editor modal — rendered outside the preview modal so z-index stacks correctly */}
+      {/* Image/Video editor modal */}
       <AnimatePresence>
         {showEditor && (
           <AssetEditorModal
             asset={asset}
             onClose={() => setShowEditor(false)}
             onSaved={() => setShowEditor(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Video Frame Studio — extract & scrub frames (Sprint 4) */}
+      <AnimatePresence>
+        {showFrames && (
+          <VideoFrameStudio
+            asset={asset}
+            onClose={() => setShowFrames(false)}
+            onPickFrame={(info) => {
+              // Sprint 5 will use this to run object removal on the chosen frame
+              console.log('Picked frame:', info);
+            }}
           />
         )}
       </AnimatePresence>
