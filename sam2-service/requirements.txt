@@ -1,0 +1,11 @@
+# sam2-service/requirements.txt
+# The web-service dependencies. PyTorch, torchvision, and SAM 2 itself are
+# installed SEPARATELY (see SETUP.md) because PyTorch must match your CUDA
+# version and SAM 2 installs from its GitHub repo.
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy>=1.24
+pillow>=10.0
+python-multipart>=0.0.9
+requests>=2.31
