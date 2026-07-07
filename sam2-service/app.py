@@ -114,6 +114,70 @@ class TrackRequest(BaseModel):
     obj_id: int = 1
 
 
+class SegmentRequest(BaseModel):
+    frames_dir: str
+    source_frame: int
+    points: list[list[float]]
+    labels: list[int]
+    obj_id: int = 1
+
+
+@app.post("/segment")
+def segment(req: SegmentRequest):
+    """
+    Fast single-frame preview: seed a click and return the mask for THAT frame
+    only, without propagating across the video. Used so the user can confirm
+    the click landed on the right object before committing to full tracking.
+    """
+    if STATE["predictor"] is None:
+        raise HTTPException(503, f"Model not ready: {STATE['error']}")
+    if not os.path.isdir(req.frames_dir):
+        raise HTTPException(400, f"frames_dir does not exist: {req.frames_dir}")
+
+    predictor = STATE["predictor"]
+    device    = STATE["device"]
+    jpeg_dir, total = prepare_jpeg_frames(req.frames_dir)
+    if req.source_frame < 0 or req.source_frame >= total:
+        raise HTTPException(400, f"source_frame {req.source_frame} out of range (0..{total-1})")
+
+    preview_dir = os.path.join(req.frames_dir, "_preview")
+    os.makedirs(preview_dir, exist_ok=True)
+
+    autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    try:
+        with torch.inference_mode(), torch.autocast(device_type=device, dtype=autocast_dtype):
+            state = predictor.init_state(
+                video_path=jpeg_dir,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+            )
+            predictor.reset_state(state)
+
+            _frame_idx, _obj_ids, mask_logits = predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=req.source_frame,
+                obj_id=req.obj_id,
+                points=np.array(req.points, dtype=np.float32),
+                labels=np.array(req.labels, dtype=np.int32),
+            )
+
+            out_path = os.path.join(preview_dir, f"preview_{req.source_frame:06d}.png")
+            save_mask(preview_dir, req.source_frame, mask_logits)
+            os.replace(
+                os.path.join(preview_dir, f"mask_{req.source_frame:06d}.png"),
+                out_path,
+            )
+
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Segmentation failed: {type(e).__name__}: {e}")
+    finally:
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    return {"mask_path": out_path, "source_frame": req.source_frame}
+
+
 @app.post("/track")
 def track(req: TrackRequest):
     if STATE["predictor"] is None:

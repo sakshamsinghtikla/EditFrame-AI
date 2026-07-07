@@ -1,12 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // src/services/tracking.service.js
-// Node → Python (SAM 2) integration (S5.3). Calls the tracking sidecar's /track
-// endpoint and returns where the per-frame masks were written. Both services
-// share the local temp folder, so we pass the frames path by reference.
+// Node → Python (SAM 2) integration.
+//   segmentObject() — S5.4: fast single-frame mask preview (confirm the click)
+//   trackObject()   — S5.2/S5.3: full video propagation (minutes on 4GB GPU)
 //
-// NOTE: /track is a long request (minutes on a 4 GB GPU). Node's built-in fetch
-// (undici) has a ~5-min headers timeout that aborts long requests with
-// "fetch failed", so we use the http module here with a generous timeout.
+// NOTE: /track is a long request. Node's built-in fetch (undici) has a ~5-min
+// headers timeout that aborts long requests with "fetch failed", so we use the
+// http module (postJsonLong) for it. /segment is fast, so plain fetch is fine.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import http from 'http';
@@ -41,7 +41,6 @@ function postJsonLong(urlStr, payload, timeoutMs) {
       }
     );
 
-    // Socket inactivity timeout — Python is silent while tracking, so keep it large
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error(`no response after ${Math.round(timeoutMs / 60000)} min`));
     });
@@ -52,7 +51,7 @@ function postJsonLong(urlStr, payload, timeoutMs) {
   });
 }
 
-// ─── Health check (quick — fetch is fine here) ───────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 
 export async function checkTrackingService() {
   try {
@@ -68,8 +67,60 @@ export async function checkTrackingService() {
   }
 }
 
-// ─── Track an object across a job's frames ───────────────────────────────────
+// ─── S5.4: Segment a single frame (fast preview, no propagation) ────────────
 
+/**
+ * @returns {Promise<{ maskPath:string, sourceFrame:number }>} absolute path to the mask PNG on disk
+ */
+export async function segmentObject({ jobId, sourceFrame, points, labels, objId = 1 }) {
+  const framesDir = path.join(getTempDir(), jobId);
+  if (!fs.existsSync(framesDir)) {
+    throw createAppError(`Frames not found for job ${jobId}. Extract frames first.`, 404, 'FRAMES_NOT_FOUND');
+  }
+  if (!Array.isArray(points) || points.length === 0) {
+    throw createAppError('At least one click point is required.', 400, 'NO_POINTS');
+  }
+
+  const health = await checkTrackingService();
+  if (!health.ready) {
+    throw createAppError(`SAM 2 model not ready: ${health.error || 'unknown'}`, 503, 'MODEL_NOT_READY');
+  }
+
+  const payload = {
+    frames_dir:   framesDir,
+    source_frame: sourceFrame,
+    points,
+    labels:       labels || points.map(() => 1),
+    obj_id:       objId,
+  };
+
+  let res;
+  try {
+    res = await fetch(`${SAM2_URL}/segment`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+      signal:  AbortSignal.timeout(300_000), // 5 min — comfortably covers cold-start JPEG conversion on a new job
+    });
+  } catch (err) {
+    throw createAppError(`Segmentation request failed: ${err.message}`, 502, 'SEGMENT_REQUEST_FAILED');
+  }
+
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try { detail = (await res.json()).detail || detail; } catch (_) {}
+    throw createAppError(`Segmentation failed: ${detail}`, 502, 'SEGMENT_FAILED');
+  }
+
+  const data = await res.json();
+  return { maskPath: data.mask_path, sourceFrame: data.source_frame };
+}
+
+// ─── S5.2/S5.3: Track an object across all of a job's frames ────────────────
+
+/**
+ * @returns {Promise<{ masksDir:string, trackedFrames:number, totalFrames:number, sourceFrame:number }>}
+ */
 export async function trackObject({ jobId, sourceFrame, points, labels, objId = 1 }) {
   const framesDir = path.join(getTempDir(), jobId);
   if (!fs.existsSync(framesDir)) {

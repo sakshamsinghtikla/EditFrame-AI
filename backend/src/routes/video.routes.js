@@ -10,7 +10,7 @@ import { protect } from '../middleware/auth.middleware.js';
 import {
   startExtraction, getExtractionStatus, listJobFrames, getMetadata, reassemble, getFrameImage,
 } from '../controllers/video.controller.js';
-import { track, trackingHealth } from '../controllers/tracking.controller.js';
+import { track, trackingHealth, segment, getPreviewMaskImage, getMaskImage } from '../controllers/tracking.controller.js';
 
 const router = Router();
 
@@ -39,8 +39,15 @@ router.get('/extract/:jobId/frames', listJobFrames);
 // Serve a single frame image (for the scrubber)
 router.get('/extract/:jobId/frame/:name', getFrameImage);
 
-// Track an object across frames with SAM 2 (S5.3)
+// Fast single-frame mask preview before full tracking (S5.4)
+router.post('/extract/:jobId/segment', segment);
+router.get('/extract/:jobId/preview-mask/:name', getPreviewMaskImage);
+
+// Track an object across frames with SAM 2 (S5.2/S5.3)
 router.post('/extract/:jobId/track', track);
+
+// Serve a tracked mask (for scrubber overlay review, S5.5)
+router.get('/extract/:jobId/mask/:name', getMaskImage);
 
 // Reassemble frames → video
 router.post('/extract/:jobId/reassemble', reassemble);
