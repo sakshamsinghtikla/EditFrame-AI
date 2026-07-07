@@ -2,6 +2,8 @@
 // EditFrame Backend — server.js
 // Express app bootstrap: middleware, route mounting, WebSocket server init.
 // ─────────────────────────────────────────────────────────────────────────────
+import videoRoutes from './src/routes/video.routes.js';
+
 
 import 'dotenv/config';
 import http from 'http';
@@ -104,6 +106,9 @@ app.use('/api/media',     mediaRoutes);
 app.use('/api/timeline',  timelineRoutes);
 app.use('/api/export',    exportRoutes);
 app.use('/api/ai',        aiRoutes);
+app.use('/api/video', videoRoutes);
+
+
 
 // ── 404 handler (must come after all routes)
 app.use(notFoundHandler);

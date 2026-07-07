@@ -90,11 +90,13 @@ async function fetchImageBuffer(url) {
 // ─── Core: run LaMa inpainting locally ────────────────────────────────────────
 
 /**
+ * Run local LaMa inpainting on a single image+mask pair.
+ * Exported so it can be reused for batch video-frame removal (S5.7).
  * @param {Buffer} imageBuffer  - original image
  * @param {Buffer} maskBuffer   - mask PNG (white = remove)
  * @returns {Promise<Buffer>}   - inpainted PNG at original resolution
  */
-async function runLaMa(imageBuffer, maskBuffer) {
+export async function runLaMa(imageBuffer, maskBuffer) {
   const session = await getSession();  // loads ortModule if not already loaded
   const ort     = ortModule;           // now safe to read
 
