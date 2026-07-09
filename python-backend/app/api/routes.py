@@ -16,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import AsyncSessionFactory, get_db_session
 from app.models import JobStatus, JobType, ProcessingJob
 from app.services.ffmpeg_service import FFmpegError, ffmpeg_service
+from app.services.lama_service import lama_service
 from app.services.sam2_service import sam2_service
+from app.tasks.inpainting_tasks import remove_object_task
 from app.tasks.sam2_tasks import segment_task, track_task
 from app.tasks.video_tasks import extract_frames_task
 
@@ -59,6 +61,16 @@ class SAMPromptRequest(BaseModel):
         if any(label not in {0, 1} for label in self.labels):
             raise ValueError("labels may contain only 0 or 1")
         return self
+
+
+class RemoveObjectRequest(BaseModel):
+    frames_dir: Path
+    masks_dir: Path
+    source_video: Path
+    fps: float | None = Field(default=None, gt=0, le=240)
+    dilation_radius: int = Field(default=4, ge=0, le=32)
+    feather_radius: float = Field(default=2.0, ge=0, le=20)
+    owner_id: str = "development-user"
 
 
 def existing_path(path: Path) -> Path:
@@ -156,6 +168,11 @@ async def sam2_health() -> dict[str, object]:
     return sam2_service.health()
 
 
+@router.get("/ai/lama/health", tags=["AI"])
+async def lama_health() -> dict[str, object]:
+    return lama_service.health()
+
+
 @router.post("/ai/segment", status_code=status.HTTP_202_ACCEPTED, tags=["AI"])
 async def segment(
     request: SAMPromptRequest,
@@ -200,6 +217,35 @@ async def track(
         request.points,
         request.labels,
         request.object_id,
+    )
+    job.celery_task_id = task.id
+    await session.commit()
+    return {"job_id": str(job.id), "status": job.status}
+
+
+@router.post("/ai/remove-object", status_code=status.HTTP_202_ACCEPTED, tags=["AI"])
+async def remove_object(
+    request: RemoveObjectRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    frames_dir = existing_path(request.frames_dir)
+    masks_dir = existing_path(request.masks_dir)
+    source_video = existing_path(request.source_video)
+
+    job = await create_job(
+        session,
+        request.owner_id,
+        JobType.INPAINTING,
+        request.model_dump(mode="json"),
+    )
+    task = remove_object_task.delay(
+        str(job.id),
+        str(frames_dir),
+        str(masks_dir),
+        str(source_video),
+        request.fps,
+        request.dilation_radius,
+        request.feather_radius,
     )
     job.celery_task_id = task.id
     await session.commit()
