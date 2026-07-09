@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
 
+    sam2_config: str = "configs/sam2.1/sam2.1_hiera_t.yaml"
+    sam2_checkpoint: Path = Path("./models/sam2.1_hiera_tiny.pt")
+    sam2_offload_video_to_cpu: bool = True
+    sam2_offload_state_to_cpu: bool = True
+
     @property
     def is_development(self) -> bool:
         return self.app_env.lower() == "development"
