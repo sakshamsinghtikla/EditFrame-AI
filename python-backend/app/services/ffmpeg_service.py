@@ -1,11 +1,15 @@
 import json
+import math
+import re
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import settings
+
+ProgressCallback = Callable[[int, str], None]
 
 
 class FFmpegError(RuntimeError):
@@ -32,7 +36,8 @@ def parse_fraction(value: str | None, fallback: float = 0.0) -> float:
     if "/" not in value:
         return float(value)
     numerator, denominator = value.split("/", 1)
-    return fallback if float(denominator) == 0 else float(numerator) / float(denominator)
+    denominator_value = float(denominator)
+    return fallback if denominator_value == 0 else float(numerator) / denominator_value
 
 
 class FFmpegService:
@@ -51,7 +56,16 @@ class FFmpegService:
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         result = subprocess.run(
-            [settings.ffprobe_bin, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(video_path)],
+            [
+                settings.ffprobe_bin,
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+                str(video_path),
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -61,14 +75,20 @@ class FFmpegService:
 
         payload = json.loads(result.stdout)
         streams = payload.get("streams", [])
-        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
         if video is None:
             raise FFmpegError("No video stream found")
 
         fps = parse_fraction(video.get("avg_frame_rate") or video.get("r_frame_rate"), 30.0)
-        duration = float(payload.get("format", {}).get("duration") or video.get("duration") or 0.0)
+        duration = float(
+            payload.get("format", {}).get("duration") or video.get("duration") or 0.0
+        )
         raw_count = video.get("nb_frames")
-        frame_count = int(raw_count) if raw_count and raw_count != "N/A" else max(1, round(duration * fps))
+        frame_count = (
+            int(raw_count)
+            if raw_count and raw_count != "N/A"
+            else max(1, round(duration * fps))
+        )
 
         return VideoMetadataResult(
             duration_seconds=duration,
@@ -77,15 +97,25 @@ class FFmpegService:
             height=int(video["height"]),
             codec=str(video.get("codec_name") or "unknown"),
             frame_count=frame_count,
-            has_audio=any(s.get("codec_type") == "audio" for s in streams),
+            has_audio=any(stream.get("codec_type") == "audio" for stream in streams),
         )
 
-    def extract_frames(self, video_path: Path, frames_dir: Path, fps: float | None = None) -> dict[str, Any]:
+    def extract_frames(
+        self,
+        video_path: Path,
+        frames_dir: Path,
+        fps: float | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         metadata = self.probe(video_path)
         target_fps = fps or metadata.fps
+        expected_frames = max(1, math.ceil(metadata.duration_seconds * target_fps))
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-        result = subprocess.run(
+        for existing_frame in frames_dir.glob("frame_*.png"):
+            existing_frame.unlink()
+
+        process = subprocess.Popen(
             [
                 settings.ffmpeg_bin,
                 "-hide_banner",
@@ -96,18 +126,37 @@ class FFmpegService:
                 f"fps={target_fps}",
                 "-start_number",
                 "0",
+                "-progress",
+                "pipe:1",
+                "-nostats",
                 str(frames_dir / "frame_%06d.png"),
             ],
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
         )
-        if result.returncode != 0:
-            raise FFmpegError(result.stderr.strip() or "Frame extraction failed")
+
+        frame_pattern = re.compile(r"^frame=(\d+)$")
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            match = frame_pattern.match(raw_line.strip())
+            if match and on_progress:
+                completed = int(match.group(1))
+                progress = min(99, max(1, round(completed / expected_frames * 100)))
+                on_progress(progress, "extracting")
+
+        stderr = process.stderr.read() if process.stderr else ""
+        return_code = process.wait()
+        if return_code != 0:
+            raise FFmpegError(stderr.strip() or "Frame extraction failed")
 
         frame_count = len(list(frames_dir.glob("frame_*.png")))
         if frame_count == 0:
             raise FFmpegError("FFmpeg produced no frames")
+
+        if on_progress:
+            on_progress(100, "completed")
 
         return {
             "frames_dir": str(frames_dir),
@@ -116,7 +165,16 @@ class FFmpegService:
             "source_metadata": metadata.to_dict(),
         }
 
-    def reassemble(self, frames_dir: Path, output_path: Path, fps: float, audio_source: Path | None = None) -> Path:
+    def reassemble(
+        self,
+        frames_dir: Path,
+        output_path: Path,
+        fps: float,
+        audio_source: Path | None = None,
+    ) -> Path:
+        if not any(frames_dir.glob("frame_*.png")):
+            raise FileNotFoundError(f"No frame_*.png files found in {frames_dir}")
+
         output_path = output_path.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,7 +190,9 @@ class FFmpegService:
             str(frames_dir.resolve() / "frame_%06d.png"),
         ]
         if audio_source is not None:
-            command.extend(["-i", str(audio_source.resolve()), "-map", "0:v:0", "-map", "1:a:0?"])
+            command.extend(
+                ["-i", str(audio_source.resolve()), "-map", "0:v:0", "-map", "1:a:0?"]
+            )
         command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps)])
         if audio_source is not None:
             command.extend(["-c:a", "aac", "-shortest"])
