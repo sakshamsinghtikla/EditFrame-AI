@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -22,13 +23,37 @@ async def update_job(job_id: UUID, **values: object) -> None:
 @celery_app.task(bind=True, name="video.extract_frames")
 def extract_frames_task(self, job_id: str, video_path: str, fps: float | None = None):
     parsed_job_id = UUID(job_id)
-    asyncio.run(update_job(parsed_job_id, status=JobStatus.RUNNING, stage="extracting", progress=5))
+    started = time.monotonic()
+    asyncio.run(
+        update_job(
+            parsed_job_id,
+            status=JobStatus.RUNNING,
+            stage="probing",
+            progress=1,
+            error_message=None,
+        )
+    )
 
     try:
+        def on_progress(progress: int, stage: str) -> None:
+            self.update_state(
+                state="PROGRESS",
+                meta={"job_id": job_id, "progress": progress, "stage": stage},
+            )
+            asyncio.run(
+                update_job(
+                    parsed_job_id,
+                    status=JobStatus.RUNNING,
+                    stage=stage,
+                    progress=progress,
+                )
+            )
+
         result = ffmpeg_service.extract_frames(
             Path(video_path),
             storage.frames_directory(parsed_job_id),
             fps=fps,
+            on_progress=on_progress,
         )
         asyncio.run(
             update_job(
@@ -37,6 +62,7 @@ def extract_frames_task(self, job_id: str, video_path: str, fps: float | None = 
                 stage="completed",
                 progress=100,
                 output_data=result,
+                elapsed_seconds=time.monotonic() - started,
             )
         )
         return result
@@ -47,6 +73,7 @@ def extract_frames_task(self, job_id: str, video_path: str, fps: float | None = 
                 status=JobStatus.FAILED,
                 stage="failed",
                 error_message=str(exc),
+                elapsed_seconds=time.monotonic() - started,
             )
         )
         raise
