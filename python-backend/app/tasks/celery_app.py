@@ -6,7 +6,11 @@ celery_app = Celery(
     "editframe",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.video_tasks", "app.tasks.sam2_tasks"],
+    include=[
+        "app.tasks.video_tasks",
+        "app.tasks.sam2_tasks",
+        "app.tasks.inpainting_tasks",
+    ],
 )
 
 celery_app.conf.update(
