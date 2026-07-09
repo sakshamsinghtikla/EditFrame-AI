@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     sam2_offload_video_to_cpu: bool = True
     sam2_offload_state_to_cpu: bool = True
 
+    lama_checkpoint: Path = Path("./models/lama_fp32.onnx")
+    lama_model_size: int = 512
+    lama_execution_provider: str = "CPUExecutionProvider"
+
     @property
     def is_development(self) -> bool:
         return self.app_env.lower() == "development"
