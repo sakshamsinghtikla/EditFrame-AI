@@ -19,3 +19,12 @@ def test_sam2_health_does_not_force_model_load(client: TestClient) -> None:
     body = response.json()
     assert body["model"] == "sam2.1_hiera_tiny"
     assert "checkpoint_exists" in body
+
+
+def test_lama_health_does_not_force_model_load(client: TestClient) -> None:
+    response = client.get("/api/v1/ai/lama/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "lama_fp32.onnx"
+    assert body["provider"] == "CPUExecutionProvider"
+    assert "checkpoint_exists" in body
