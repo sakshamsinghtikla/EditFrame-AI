@@ -10,6 +10,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -261,6 +262,32 @@ async def get_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job_payload(job)
+
+
+@router.get("/jobs/{job_id}/result", tags=["jobs"])
+async def download_job_result(
+    job_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> FileResponse:
+    job = await session.get(ProcessingJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="Job has not completed")
+
+    result_path_value = (job.output_data or {}).get("result_video")
+    if not result_path_value:
+        raise HTTPException(status_code=404, detail="This job has no downloadable video")
+
+    result_path = Path(str(result_path_value)).expanduser().resolve()
+    if not result_path.is_file():
+        raise HTTPException(status_code=410, detail="Result file is no longer available")
+
+    return FileResponse(
+        path=result_path,
+        media_type="video/mp4",
+        filename=f"editframe-object-removed-{job_id}.mp4",
+    )
 
 
 @router.websocket("/ws/jobs/{job_id}")
